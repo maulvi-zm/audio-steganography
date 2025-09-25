@@ -112,12 +112,12 @@ func (h *StegoHandler) InsertMessage(c *gin.Context) {
 		return
 	}
 
-	// Decode MP3 to PCM data
-	pcmData, audioMetadata, err := h.audioDecoder.DecodeMP3(audioData)
+	// Analyze MP3 structure
+	mp3Info, err := h.audioDecoder.AnalyzeMP3(audioData)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.StegoResponse{
 			Success: false,
-			Message: fmt.Sprintf("Failed to decode MP3 file: %v", err),
+			Message: fmt.Sprintf("Failed to analyze MP3 file: %v", err),
 		})
 		return
 	}
@@ -140,8 +140,16 @@ func (h *StegoHandler) InsertMessage(c *gin.Context) {
 		SecretFilename: secretHeader.Filename,
 	}
 
-	lsbStego := stego.NewLSBSteganography(config)
-	capacity := lsbStego.CalculateCapacity(pcmData)
+	mp3Stego := stego.NewMP3LSBSteganography(config)
+	capacity, err := mp3Stego.CalculateCapacity(audioData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.StegoResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to calculate capacity: %v", err),
+		})
+		return
+	}
+
 	if len(secretData)+len(secretHeader.Filename)+8 > capacity {
 		c.JSON(http.StatusBadRequest, models.StegoResponse{
 			Success: false,
@@ -151,25 +159,12 @@ func (h *StegoHandler) InsertMessage(c *gin.Context) {
 		return
 	}
 
-	// Embed secret data into PCM
-	stegoPCM, err := lsbStego.Embed(pcmData, secretData)
+	// Embed secret data directly into MP3 bitstream
+	stegoAudio, err := mp3Stego.EmbedInMP3(audioData, secretData)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.StegoResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to embed secret data: %v", err),
-		})
-		return
-	}
-
-	// Calculate PSNR between original and stego PCM data
-	psnr := audio.CalculatePSNRFloat64(bytesToFloat64(pcmData), bytesToFloat64(stegoPCM))
-
-	// Encode stego PCM back to MP3 format while preserving original headers
-	stegoAudio, err := h.audioDecoder.EncodePCMToMP3(stegoPCM, audioMetadata, audioData)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.StegoResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to encode stego audio: %v", err),
 		})
 		return
 	}
@@ -184,10 +179,11 @@ func (h *StegoHandler) InsertMessage(c *gin.Context) {
 	c.Header("Content-Type", "audio/mpeg")
 	c.Header("Content-Length", fmt.Sprintf("%d", len(stegoAudio)))
 
-	// Include PSNR value in custom header for quality assessment
-	c.Header("X-Stego-PSNR", fmt.Sprintf("%.2f", psnr))
-	c.Header("X-Stego-Message", "Secret message successfully embedded in MP3 file")
-	c.Header("X-Stego-Metadata-Preserved", "true")
+	// Include metadata about the steganography operation
+	c.Header("X-Stego-Method", "MP3 Bitstream LSB")
+	c.Header("X-Stego-Message", "Secret message successfully embedded directly in MP3 bitstream")
+	c.Header("X-Stego-Capacity", fmt.Sprintf("%d", capacity))
+	c.Header("X-Stego-Frames", fmt.Sprintf("%d", mp3Info.TotalFrames))
 
 	c.Data(http.StatusOK, "audio/mpeg", stegoAudio)
 }
@@ -258,15 +254,6 @@ func (h *StegoHandler) ExtractMessage(c *gin.Context) {
 		return
 	}
 
-	stegoPCM, _, err := h.audioDecoder.DecodeMP3(stegoAudio)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ExtractResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to decode MP3 stego file: %v", err),
-		})
-		return
-	}
-
 	config := &models.StegoConfig{
 		Key:            key,
 		UseEncryption:  useEncryption,
@@ -274,13 +261,21 @@ func (h *StegoHandler) ExtractMessage(c *gin.Context) {
 		LSBBits:        lsbBits,
 	}
 
-	// Extraction
-	lsbStego := stego.NewLSBSteganography(config)
-	secretData, secretFilename, err := lsbStego.Extract(stegoPCM)
+	// Extract directly from MP3 bitstream
+	mp3Stego := stego.NewMP3LSBSteganography(config)
+	secretData, secretFilename, err := mp3Stego.ExtractFromMP3(stegoAudio)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ExtractResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to extract secret data: %v", err),
+		})
+		return
+	}
+
+	if len(secretData) == 0 {
+		c.JSON(http.StatusInternalServerError, models.ExtractResponse{
+			Success: false,
+			Message: "No secret data extracted. Possible causes: (1) File contains no embedded data, (2) Wrong extraction parameters (key, LSB bits, encryption, random start), (3) MP3 file structure was modified after embedding.",
 		})
 		return
 	}
@@ -298,23 +293,4 @@ func (h *StegoHandler) ExtractMessage(c *gin.Context) {
 func isValidMP3File(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))
 	return ext == ".mp3"
-}
-
-func bytesToFloat64(data []byte) []float64 {
-	if len(data)%2 != 0 {
-		// Handle odd length by ignoring the last byte
-		data = data[:len(data)-1]
-	}
-
-	samples := make([]float64, len(data)/2)
-	for i := range samples {
-		// Read little-endian 16-bit sample
-		low := int16(data[i*2])
-		high := int16(data[i*2+1])
-		sample := low | (high << 8)
-
-		// Convert to float64 normalized to [-1.0, 1.0]
-		samples[i] = float64(sample) / 32768.0
-	}
-	return samples
 }
