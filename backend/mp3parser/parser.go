@@ -193,10 +193,7 @@ func WriteMP3File(mp3File *MP3File) ([]byte, error) {
 	}
 
 	for _, frame := range mp3File.Frames {
-		// Write original frame header bytes (NEVER MODIFIED)
 		buf.Write(frame.HeaderBytes)
-
-		// Write frame data (potentially modified by steganography)
 		buf.Write(frame.Data)
 	}
 

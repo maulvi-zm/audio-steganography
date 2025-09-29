@@ -1,4 +1,4 @@
-// Package stego to implement LSB
+// Package stego
 package stego
 
 import (
@@ -8,19 +8,19 @@ import (
 	"math/rand"
 	"steganography-backend/crypto"
 	"steganography-backend/models"
+	"steganography-backend/mp3parser"
 )
 
-type LSBSteganography struct {
+type MP3AncillaryLSBSteganography struct {
 	config *models.StegoConfig
 	rng    *rand.Rand
 }
 
-func NewLSBSteganography(config *models.StegoConfig) *LSBSteganography {
-	// Create deterministic random number generator from key
+func NewMP3AncillaryLSBSteganography(config *models.StegoConfig) *MP3AncillaryLSBSteganography {
 	seed := generateSeed(config.Key)
 	rng := rand.New(rand.NewSource(seed))
 
-	return &LSBSteganography{
+	return &MP3AncillaryLSBSteganography{
 		config: config,
 		rng:    rng,
 	}
@@ -31,18 +31,41 @@ func generateSeed(key string) int64 {
 	return int64(binary.BigEndian.Uint64(hash[:8]))
 }
 
-func (lsb *LSBSteganography) CalculateCapacity(pcmData []byte) int {
-	// We need space for: filename length (4 bytes) + filename + data length (4 bytes) + data
+func (lsb *MP3AncillaryLSBSteganography) CalculateCapacity(mp3Data []byte) (int, error) {
+	mp3File, err := mp3parser.ParseMP3File(mp3Data)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse MP3: %v", err)
+	}
+
+	totalSafeBytes := 0
+	for _, frame := range mp3File.Frames {
+		regions, err := mp3parser.AnalyzeFrameData(frame.Header, frame.Data)
+		if err != nil {
+			continue // Skip problematic frames
+		}
+
+		safeBytes := regions.GetSafeModificationBytes()
+		totalSafeBytes += len(safeBytes)
+	}
+
+	if totalSafeBytes == 0 {
+		return 0, fmt.Errorf("no safe ancillary data found in MP3 frames")
+	}
+
 	bitsPerByte := lsb.config.LSBBits
-	totalBits := len(pcmData) * bitsPerByte
-	totalBytes := totalBits / 8
+	totalBits := totalSafeBytes * bitsPerByte
+	capacity := totalBits / 8
 
 	// Reserve space for metadata (filename length + data length)
 	metadataBytes := 8 // 4 bytes for filename length + 4 bytes for data length
-	return totalBytes - metadataBytes
+	if capacity < metadataBytes {
+		return 0, fmt.Errorf("insufficient ancillary data for metadata")
+	}
+
+	return capacity - metadataBytes, nil
 }
 
-func (lsb *LSBSteganography) Embed(pcmData []byte, secretData []byte) ([]byte, error) {
+func (lsb *MP3AncillaryLSBSteganography) EmbedInMP3(mp3Data []byte, secretData []byte) ([]byte, error) {
 	// Prepare payload: filename length + filename + data length + data
 	filename := []byte(lsb.config.SecretFilename)
 	payload := make([]byte, 0)
@@ -68,23 +91,54 @@ func (lsb *LSBSteganography) Embed(pcmData []byte, secretData []byte) ([]byte, e
 		cipher := crypto.NewExtendedVigenere(lsb.config.Key)
 		payload = cipher.Encrypt(payload)
 	}
-	capacity := lsb.CalculateCapacity(pcmData)
+
+	// Parse MP3 file
+	mp3File, err := mp3parser.ParseMP3File(mp3Data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse MP3: %v", err)
+	}
+
+	// Check capacity
+	capacity, err := lsb.CalculateCapacity(mp3Data)
+	if err != nil {
+		return nil, err
+	}
 	if len(payload) > capacity {
 		return nil, fmt.Errorf("secret data too large: %d bytes, capacity: %d bytes", len(payload), capacity)
 	}
 
-	// Create copy of PCM data for modification
-	stegoPCM := make([]byte, len(pcmData))
-	copy(stegoPCM, pcmData)
+	// Collect all safe bytes from all frames
+	allSafeBytes := make([]byte, 0)
+	frameRegions := make([]*mp3parser.MP3FrameRegions, 0)
 
-	// Calculate how many audio samples we need based on LSB bits per sample
-	totalPayloadBits := len(payload) * 8
-	samplesNeeded := totalPayloadBits / lsb.config.LSBBits
-	if totalPayloadBits%lsb.config.LSBBits != 0 {
-		samplesNeeded++
+	for _, frame := range mp3File.Frames {
+		regions, err := mp3parser.AnalyzeFrameData(frame.Header, frame.Data)
+		if err != nil {
+			// Create empty regions for problematic frames
+			regions = &mp3parser.MP3FrameRegions{}
+		}
+
+		frameRegions = append(frameRegions, regions)
+		safeBytes := regions.GetSafeModificationBytes()
+		allSafeBytes = append(allSafeBytes, safeBytes...)
 	}
 
-	positions := lsb.generatePositions(len(pcmData), samplesNeeded)
+	if len(allSafeBytes) == 0 {
+		return nil, fmt.Errorf("no safe ancillary data available for embedding")
+	}
+
+	// Calculate how many bytes we need based on LSB bits per byte
+	totalPayloadBits := len(payload) * 8
+	bytesNeeded := totalPayloadBits / lsb.config.LSBBits
+	if totalPayloadBits%lsb.config.LSBBits != 0 {
+		bytesNeeded++
+	}
+
+	if bytesNeeded > len(allSafeBytes) {
+		return nil, fmt.Errorf("insufficient safe bytes: need %d, have %d", bytesNeeded, len(allSafeBytes))
+	}
+
+	positions := lsb.generatePositions(len(allSafeBytes), bytesNeeded)
 
 	// Convert payload to bits for multi-bit embedding
 	payloadBits := bytesToBits(payload)
@@ -105,109 +159,77 @@ func (lsb *LSBSteganography) Embed(pcmData []byte, secretData []byte) ([]byte, e
 			bitIndex++
 		}
 
-		// Clear the LSB bits and set new ones
-		stegoPCM[pos] = (stegoPCM[pos] & ^mask) | (bitsToEmbed & mask)
+		// Modify the byte in allSafeBytes
+		allSafeBytes[pos] = (allSafeBytes[pos] & ^mask) | (bitsToEmbed & mask)
 	}
 
-	return stegoPCM, nil
+	// Put modified safe data back into frames
+	safeByteIndex := 0
+	for i, frame := range mp3File.Frames {
+		regions := frameRegions[i]
+		originalSafeBytes := regions.GetSafeModificationBytes()
+
+		if len(originalSafeBytes) > 0 {
+			// Extract the modified safe bytes for this frame
+			modifiedSafeBytes := allSafeBytes[safeByteIndex : safeByteIndex+len(originalSafeBytes)]
+			safeByteIndex += len(originalSafeBytes)
+
+			// Reconstruct frame data with modified safe bytes
+			frame.Data = regions.ReconstructFrameData(modifiedSafeBytes)
+		}
+	}
+
+	// Reconstruct MP3 file
+	return mp3parser.WriteMP3File(mp3File)
 }
 
-func (lsb *LSBSteganography) Extract(stegoPCM []byte) ([]byte, string, error) {
-
-	// First extract enough samples to get the filename length (4 bytes = 32 bits)
-	filenameMetadataBits := 32
-	samplesNeeded := filenameMetadataBits / lsb.config.LSBBits
-	if filenameMetadataBits%lsb.config.LSBBits != 0 {
-		samplesNeeded++
+func (lsb *MP3AncillaryLSBSteganography) ExtractFromMP3(mp3Data []byte) ([]byte, string, error) {
+	// Parse MP3 file
+	mp3File, err := mp3parser.ParseMP3File(mp3Data)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to parse MP3: %v", err)
 	}
 
-	positions := lsb.generatePositions(len(stegoPCM), samplesNeeded)
-	if len(positions) < samplesNeeded {
-		return nil, "", fmt.Errorf("insufficient data for metadata extraction")
+	// Collect all safe bytes from all frames
+	allSafeBytes := make([]byte, 0)
+	for _, frame := range mp3File.Frames {
+		regions, err := mp3parser.AnalyzeFrameData(frame.Header, frame.Data)
+		if err != nil {
+			continue // Skip problematic frames
+		}
+
+		safeBytes := regions.GetSafeModificationBytes()
+		allSafeBytes = append(allSafeBytes, safeBytes...)
 	}
 
-	// Extract bits to reconstruct filename length
+	if len(allSafeBytes) == 0 {
+		return nil, "", fmt.Errorf("no safe ancillary data found")
+	}
+
+	// Generate positions for ALL available safe bytes to get the complete permutation
+	positions := lsb.generatePositions(len(allSafeBytes), len(allSafeBytes))
+	if len(positions) == 0 {
+		return nil, "", fmt.Errorf("no positions generated for extraction")
+	}
+
+	// Extract all available bits using the complete position sequence
 	extractedBits := make([]byte, 0)
 	mask := byte((1 << lsb.config.LSBBits) - 1)
 
-	for i := 0; i < samplesNeeded; i++ {
-		lsbValue := stegoPCM[positions[i]] & mask
+	for i := range positions {
+		lsbValue := allSafeBytes[positions[i]] & mask
 		// Unpack bits from this LSB value
-		for j := 0; j < lsb.config.LSBBits && len(extractedBits) < filenameMetadataBits; j++ {
+		for j := 0; j < lsb.config.LSBBits; j++ {
 			extractedBits = append(extractedBits, (lsbValue>>j)&1)
 		}
 	}
 
-	// Convert bits to bytes to get filename length
-	filenameBytes := bitsToBytes(extractedBits[:filenameMetadataBits])
-	if len(filenameBytes) < 4 {
-		return nil, "", fmt.Errorf("insufficient data for filename length")
+	// Now parse the extracted bits sequentially
+	extractedBytes := bitsToBytes(extractedBits)
+
+	if len(extractedBytes) < 8 {
+		return nil, "", fmt.Errorf("insufficient extracted data for basic metadata")
 	}
-
-	filenameLen := binary.BigEndian.Uint32(filenameBytes[0:4])
-	if filenameLen > 255 {
-		return nil, "", fmt.Errorf("invalid filename length: %d", filenameLen)
-	}
-
-	// Now extract enough for: filename length (4) + filename + data length (4)
-	metadataBits := (8 + int(filenameLen)) * 8
-	samplesNeeded = metadataBits / lsb.config.LSBBits
-	if metadataBits%lsb.config.LSBBits != 0 {
-		samplesNeeded++
-	}
-
-	positions = lsb.generatePositions(len(stegoPCM), samplesNeeded)
-	if len(positions) < samplesNeeded {
-		return nil, "", fmt.Errorf("insufficient positions for metadata extraction")
-	}
-
-	// Extract all metadata bits
-	extractedBits = make([]byte, 0)
-	for i := 0; i < samplesNeeded; i++ {
-		lsbValue := stegoPCM[positions[i]] & mask
-		// Unpack bits from this LSB value
-		for j := 0; j < lsb.config.LSBBits && len(extractedBits) < metadataBits; j++ {
-			extractedBits = append(extractedBits, (lsbValue>>j)&1)
-		}
-	}
-
-	extractedBytes := bitsToBytes(extractedBits[:metadataBits])
-
-	if len(extractedBytes) < int(8+filenameLen) {
-		return nil, "", fmt.Errorf("insufficient extracted data for metadata")
-	}
-
-	// Parse filename
-	filename := string(extractedBytes[4 : 4+filenameLen])
-
-	dataLen := binary.BigEndian.Uint32(extractedBytes[4+filenameLen : 4+filenameLen+4])
-	if dataLen > 10*1024*1024 { // 10MB sanity check
-		return nil, "", fmt.Errorf("invalid data length: %d", dataLen)
-	}
-
-	// Now extract the complete payload: metadata + actual data
-	totalPayloadBits := (8 + int(filenameLen) + int(dataLen)) * 8
-	samplesNeeded = totalPayloadBits / lsb.config.LSBBits
-	if totalPayloadBits%lsb.config.LSBBits != 0 {
-		samplesNeeded++
-	}
-
-	positions = lsb.generatePositions(len(stegoPCM), samplesNeeded)
-	if len(positions) < samplesNeeded {
-		return nil, "", fmt.Errorf("insufficient positions for complete payload extraction")
-	}
-
-	// Extract all payload bits
-	extractedBits = make([]byte, 0)
-	for i := 0; i < samplesNeeded; i++ {
-		lsbValue := stegoPCM[positions[i]] & mask
-		// Unpack bits from this LSB value
-		for j := 0; j < lsb.config.LSBBits && len(extractedBits) < totalPayloadBits; j++ {
-			extractedBits = append(extractedBits, (lsbValue>>j)&1)
-		}
-	}
-
-	extractedBytes = bitsToBytes(extractedBits[:totalPayloadBits])
 
 	// Decrypt the entire payload if encryption was used
 	if lsb.config.UseEncryption {
@@ -215,16 +237,23 @@ func (lsb *LSBSteganography) Extract(stegoPCM []byte) ([]byte, string, error) {
 		extractedBytes = cipher.Decrypt(extractedBytes)
 	}
 
-	// Re-parse decrypted metadata to get correct filename and data length
-	filenameLen = binary.BigEndian.Uint32(extractedBytes[0:4])
+	// Parse filename length
+	filenameLen := binary.BigEndian.Uint32(extractedBytes[0:4])
 	if filenameLen > 255 {
-		return nil, "", fmt.Errorf("invalid decrypted filename length: %d", filenameLen)
+		return nil, "", fmt.Errorf("invalid filename length: %d", filenameLen)
 	}
 
-	filename = string(extractedBytes[4 : 4+filenameLen])
-	dataLen = binary.BigEndian.Uint32(extractedBytes[4+filenameLen : 4+filenameLen+4])
+	if len(extractedBytes) < int(8+filenameLen) {
+		return nil, "", fmt.Errorf("insufficient extracted data for filename")
+	}
+
+	// Parse filename
+	filename := string(extractedBytes[4 : 4+filenameLen])
+
+	// Parse data length
+	dataLen := binary.BigEndian.Uint32(extractedBytes[4+filenameLen : 4+filenameLen+4])
 	if dataLen > 10*1024*1024 { // 10MB sanity check
-		return nil, "", fmt.Errorf("invalid decrypted data length: %d", dataLen)
+		return nil, "", fmt.Errorf("invalid data length: %d", dataLen)
 	}
 
 	dataStart := 4 + filenameLen + 4
@@ -237,20 +266,33 @@ func (lsb *LSBSteganography) Extract(stegoPCM []byte) ([]byte, string, error) {
 	return secretData, filename, nil
 }
 
-func (lsb *LSBSteganography) generatePositions(audioLen, bitsNeeded int) []int {
+func (lsb *MP3AncillaryLSBSteganography) generatePositions(dataLen, bytesNeeded int) []int {
 	positions := make([]int, 0)
 
 	if lsb.config.UseRandomStart {
+		seed := generateSeed(lsb.config.Key)
+		lsb.rng.Seed(seed)
+
+		// Generate a FIXED permutation of all available positions
 		used := make(map[int]bool)
-		for len(positions) < bitsNeeded && len(positions) < audioLen {
-			pos := lsb.rng.Intn(audioLen)
+		allPositions := make([]int, 0, dataLen)
+
+		// Generate the complete random permutation of all available positions
+		for len(allPositions) < dataLen {
+			pos := lsb.rng.Intn(dataLen)
 			if !used[pos] {
-				positions = append(positions, pos)
+				allPositions = append(allPositions, pos)
 				used[pos] = true
 			}
 		}
+
+		// Return only the first bytesNeeded positions from the fixed permutation
+		if bytesNeeded > len(allPositions) {
+			bytesNeeded = len(allPositions)
+		}
+		positions = allPositions[:bytesNeeded]
 	} else {
-		for i := 0; i < bitsNeeded && i < audioLen; i++ {
+		for i := 0; i < bytesNeeded && i < dataLen; i++ {
 			positions = append(positions, i)
 		}
 	}
