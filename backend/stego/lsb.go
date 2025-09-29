@@ -43,11 +43,6 @@ func (lsb *LSBSteganography) CalculateCapacity(pcmData []byte) int {
 }
 
 func (lsb *LSBSteganography) Embed(pcmData []byte, secretData []byte) ([]byte, error) {
-	if lsb.config.UseEncryption {
-		cipher := crypto.NewExtendedVigenere(lsb.config.Key)
-		secretData = cipher.Encrypt(secretData)
-	}
-
 	// Prepare payload: filename length + filename + data length + data
 	filename := []byte(lsb.config.SecretFilename)
 	payload := make([]byte, 0)
@@ -65,87 +60,179 @@ func (lsb *LSBSteganography) Embed(pcmData []byte, secretData []byte) ([]byte, e
 	binary.BigEndian.PutUint32(dataLen, uint32(len(secretData)))
 	payload = append(payload, dataLen...)
 
-	// Add secret data and check the capacity
+	// Add secret data
 	payload = append(payload, secretData...)
+
+	// Encrypt the entire payload if encryption is enabled
+	if lsb.config.UseEncryption {
+		cipher := crypto.NewExtendedVigenere(lsb.config.Key)
+		payload = cipher.Encrypt(payload)
+	}
 	capacity := lsb.CalculateCapacity(pcmData)
 	if len(payload) > capacity {
 		return nil, fmt.Errorf("secret data too large: %d bytes, capacity: %d bytes", len(payload), capacity)
 	}
 
-	payloadBits := bytesToBits(payload)
-
 	// Create copy of PCM data for modification
 	stegoPCM := make([]byte, len(pcmData))
 	copy(stegoPCM, pcmData)
 
-	positions := lsb.generatePositions(len(pcmData), len(payloadBits))
+	// Calculate how many audio samples we need based on LSB bits per sample
+	totalPayloadBits := len(payload) * 8
+	samplesNeeded := totalPayloadBits / lsb.config.LSBBits
+	if totalPayloadBits%lsb.config.LSBBits != 0 {
+		samplesNeeded++
+	}
 
-	// Embed bits
+	positions := lsb.generatePositions(len(pcmData), samplesNeeded)
+
+	// Convert payload to bits for multi-bit embedding
+	payloadBits := bytesToBits(payload)
+
+	// Embed bits using LSBBits per position
+	mask := byte((1 << lsb.config.LSBBits) - 1)
 	bitIndex := 0
+
 	for _, pos := range positions {
 		if bitIndex >= len(payloadBits) {
 			break
 		}
 
+		// Pack multiple bits into LSB positions
+		var bitsToEmbed byte = 0
+		for j := 0; j < lsb.config.LSBBits && bitIndex < len(payloadBits); j++ {
+			bitsToEmbed |= (payloadBits[bitIndex] << j)
+			bitIndex++
+		}
+
 		// Clear the LSB bits and set new ones
-		mask := byte((1 << lsb.config.LSBBits) - 1)
-		stegoPCM[pos] = (stegoPCM[pos] & ^mask) | (payloadBits[bitIndex] & mask)
-		bitIndex++
+		stegoPCM[pos] = (stegoPCM[pos] & ^mask) | (bitsToEmbed & mask)
 	}
 
 	return stegoPCM, nil
 }
 
 func (lsb *LSBSteganography) Extract(stegoPCM []byte) ([]byte, string, error) {
-	positions := lsb.generatePositions(len(stegoPCM), len(stegoPCM)*lsb.config.LSBBits)
 
-	metadataBits := 32 // 4 bytes for filename length
-	if len(positions) < metadataBits/lsb.config.LSBBits {
+	// First extract enough samples to get the filename length (4 bytes = 32 bits)
+	filenameMetadataBits := 32
+	samplesNeeded := filenameMetadataBits / lsb.config.LSBBits
+	if filenameMetadataBits%lsb.config.LSBBits != 0 {
+		samplesNeeded++
+	}
+
+	positions := lsb.generatePositions(len(stegoPCM), samplesNeeded)
+	if len(positions) < samplesNeeded {
 		return nil, "", fmt.Errorf("insufficient data for metadata extraction")
 	}
 
+	// Extract bits to reconstruct filename length
 	extractedBits := make([]byte, 0)
 	mask := byte((1 << lsb.config.LSBBits) - 1)
 
-	// Extract bits according to positions
-	for i, pos := range positions {
-		if i >= len(stegoPCM)*lsb.config.LSBBits {
-			break
+	for i := 0; i < samplesNeeded; i++ {
+		lsbValue := stegoPCM[positions[i]] & mask
+		// Unpack bits from this LSB value
+		for j := 0; j < lsb.config.LSBBits && len(extractedBits) < filenameMetadataBits; j++ {
+			extractedBits = append(extractedBits, (lsbValue>>j)&1)
 		}
-		extractedBits = append(extractedBits, stegoPCM[pos]&mask)
 	}
 
-	extractedBytes := bitsToBytes(extractedBits)
-
-	if len(extractedBytes) < 8 { // minimum: 4 bytes filename length + 4 bytes data length
-		return nil, "", fmt.Errorf("insufficient extracted data")
+	// Convert bits to bytes to get filename length
+	filenameBytes := bitsToBytes(extractedBits[:filenameMetadataBits])
+	if len(filenameBytes) < 4 {
+		return nil, "", fmt.Errorf("insufficient data for filename length")
 	}
 
-	// Parse filename length
-	filenameLen := binary.BigEndian.Uint32(extractedBytes[0:4])
-	if filenameLen > 255 || int(filenameLen) > len(extractedBytes)-8 {
+	filenameLen := binary.BigEndian.Uint32(filenameBytes[0:4])
+	if filenameLen > 255 {
 		return nil, "", fmt.Errorf("invalid filename length: %d", filenameLen)
 	}
 
-	filename := string(extractedBytes[4 : 4+filenameLen])
-	if len(extractedBytes) < int(4+filenameLen+4) {
-		return nil, "", fmt.Errorf("insufficient data for data length")
+	// Now extract enough for: filename length (4) + filename + data length (4)
+	metadataBits := (8 + int(filenameLen)) * 8
+	samplesNeeded = metadataBits / lsb.config.LSBBits
+	if metadataBits%lsb.config.LSBBits != 0 {
+		samplesNeeded++
 	}
 
-	dataLen := binary.BigEndian.Uint32(extractedBytes[4+filenameLen : 4+filenameLen+4])
-	dataStart := 4 + filenameLen + 4
+	positions = lsb.generatePositions(len(stegoPCM), samplesNeeded)
+	if len(positions) < samplesNeeded {
+		return nil, "", fmt.Errorf("insufficient positions for metadata extraction")
+	}
 
+	// Extract all metadata bits
+	extractedBits = make([]byte, 0)
+	for i := 0; i < samplesNeeded; i++ {
+		lsbValue := stegoPCM[positions[i]] & mask
+		// Unpack bits from this LSB value
+		for j := 0; j < lsb.config.LSBBits && len(extractedBits) < metadataBits; j++ {
+			extractedBits = append(extractedBits, (lsbValue>>j)&1)
+		}
+	}
+
+	extractedBytes := bitsToBytes(extractedBits[:metadataBits])
+
+	if len(extractedBytes) < int(8+filenameLen) {
+		return nil, "", fmt.Errorf("insufficient extracted data for metadata")
+	}
+
+	// Parse filename
+	filename := string(extractedBytes[4 : 4+filenameLen])
+
+	dataLen := binary.BigEndian.Uint32(extractedBytes[4+filenameLen : 4+filenameLen+4])
+	if dataLen > 10*1024*1024 { // 10MB sanity check
+		return nil, "", fmt.Errorf("invalid data length: %d", dataLen)
+	}
+
+	// Now extract the complete payload: metadata + actual data
+	totalPayloadBits := (8 + int(filenameLen) + int(dataLen)) * 8
+	samplesNeeded = totalPayloadBits / lsb.config.LSBBits
+	if totalPayloadBits%lsb.config.LSBBits != 0 {
+		samplesNeeded++
+	}
+
+	positions = lsb.generatePositions(len(stegoPCM), samplesNeeded)
+	if len(positions) < samplesNeeded {
+		return nil, "", fmt.Errorf("insufficient positions for complete payload extraction")
+	}
+
+	// Extract all payload bits
+	extractedBits = make([]byte, 0)
+	for i := 0; i < samplesNeeded; i++ {
+		lsbValue := stegoPCM[positions[i]] & mask
+		// Unpack bits from this LSB value
+		for j := 0; j < lsb.config.LSBBits && len(extractedBits) < totalPayloadBits; j++ {
+			extractedBits = append(extractedBits, (lsbValue>>j)&1)
+		}
+	}
+
+	extractedBytes = bitsToBytes(extractedBits[:totalPayloadBits])
+
+	// Decrypt the entire payload if encryption was used
+	if lsb.config.UseEncryption {
+		cipher := crypto.NewExtendedVigenere(lsb.config.Key)
+		extractedBytes = cipher.Decrypt(extractedBytes)
+	}
+
+	// Re-parse decrypted metadata to get correct filename and data length
+	filenameLen = binary.BigEndian.Uint32(extractedBytes[0:4])
+	if filenameLen > 255 {
+		return nil, "", fmt.Errorf("invalid decrypted filename length: %d", filenameLen)
+	}
+
+	filename = string(extractedBytes[4 : 4+filenameLen])
+	dataLen = binary.BigEndian.Uint32(extractedBytes[4+filenameLen : 4+filenameLen+4])
+	if dataLen > 10*1024*1024 { // 10MB sanity check
+		return nil, "", fmt.Errorf("invalid decrypted data length: %d", dataLen)
+	}
+
+	dataStart := 4 + filenameLen + 4
 	if int(dataStart+dataLen) > len(extractedBytes) {
 		return nil, "", fmt.Errorf("insufficient extracted data: expected %d bytes, got %d", dataLen, len(extractedBytes)-int(dataStart))
 	}
 
 	secretData := extractedBytes[dataStart : dataStart+dataLen]
-
-	// Decrypt if encryption was used
-	if lsb.config.UseEncryption {
-		cipher := crypto.NewExtendedVigenere(lsb.config.Key)
-		secretData = cipher.Decrypt(secretData)
-	}
 
 	return secretData, filename, nil
 }

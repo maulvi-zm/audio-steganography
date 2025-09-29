@@ -2,7 +2,10 @@ package audio
 
 import (
 	"fmt"
+	"steganography-backend/models"
 	"steganography-backend/mp3parser"
+
+	"github.com/tosone/minimp3"
 )
 
 const (
@@ -47,6 +50,29 @@ func (ad *AudioDecoder) AnalyzeMP3(mp3Data []byte) (*MP3Info, error) {
 		HasID3v1:       mp3File.ID3v1 != nil,
 		HasID3v2:       mp3File.ID3v2 != nil,
 	}, nil
+}
+
+// DecodeMP3ToPCM decodes MP3 data to PCM for PSNR calculation
+func (ad *AudioDecoder) DecodeMP3ToPCM(mp3Data []byte) ([]byte, *models.AudioMetadata, error) {
+	decoder, data, err := minimp3.DecodeFull(mp3Data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to decode MP3: %v", err)
+	}
+	defer decoder.Close()
+
+	totalBytes := len(data)
+	samplesPerChannel := totalBytes / 2 / decoder.Channels // 2 bytes per 16-bit sample
+	duration := float64(samplesPerChannel) / float64(decoder.SampleRate)
+
+	metadata := &models.AudioMetadata{
+		SampleRate: decoder.SampleRate,
+		Channels:   decoder.Channels,
+		BitDepth:   16,
+		Duration:   duration,
+		TotalBytes: totalBytes,
+	}
+
+	return data, metadata, nil
 }
 
 // MP3Info contains information about an MP3 file

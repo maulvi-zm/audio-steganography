@@ -16,7 +16,6 @@ func syncSafeToInt(b []byte) int {
 		int(b[3]&0x7F)
 }
 
-// Read ID3v2 tag if present
 func ReadID3v2(r io.Reader) (*ID3v2Header, []byte, error) {
 	buf := make([]byte, 10)
 	_, err := io.ReadFull(r, buf)
@@ -46,7 +45,6 @@ func ReadID3v2(r io.Reader) (*ID3v2Header, []byte, error) {
 	return h, id3Data, nil
 }
 
-// Read one MP3 frame header
 func ReadFrameHeader(r io.Reader) (*MP3FrameHeader, []byte, []byte, error) {
 	headerBytes := make([]byte, 4)
 	_, err := io.ReadFull(r, headerBytes)
@@ -104,7 +102,6 @@ func ReadFrameHeader(r io.Reader) (*MP3FrameHeader, []byte, []byte, error) {
 	return h, headerBytes, data, nil
 }
 
-// Read ID3v1 (last 128 bytes)
 func ReadID3v1(f *os.File) (*ID3v1Tag, error) {
 	stat, err := f.Stat()
 	if err != nil {
@@ -162,8 +159,8 @@ func ParseMP3File(data []byte) (*MP3File, error) {
 
 		frame := &MP3Frame{
 			Header:      frameHeader,
-			HeaderBytes: headerBytes, // Store original header bytes - NEVER MODIFY
-			Data:        frameData,   // Only this gets modified for steganography
+			HeaderBytes: headerBytes,
+			Data:        frameData,
 		}
 		mp3File.Frames = append(mp3File.Frames, frame)
 	}
@@ -171,8 +168,6 @@ func ParseMP3File(data []byte) (*MP3File, error) {
 	return mp3File, nil
 }
 
-// WriteMP3File reconstructs MP3 data from MP3File structure
-// IMPORTANT: Uses original header bytes - never reconstructs frame headers
 func WriteMP3File(mp3File *MP3File) ([]byte, error) {
 	var buf bytes.Buffer
 
@@ -197,7 +192,6 @@ func WriteMP3File(mp3File *MP3File) ([]byte, error) {
 		buf.Write(mp3File.ID3v2Data)
 	}
 
-	// Write MP3 frames using ORIGINAL header bytes
 	for _, frame := range mp3File.Frames {
 		// Write original frame header bytes (NEVER MODIFIED)
 		buf.Write(frame.HeaderBytes)

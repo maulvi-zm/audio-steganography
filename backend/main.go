@@ -23,7 +23,7 @@ func main() {
 	config.AllowOrigins = []string{"http://localhost:3000"}
 	config.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"}
-	config.ExposeHeaders = []string{"X-Stego-PSNR", "X-Stego-Message"} // Expose custom headers
+	config.ExposeHeaders = []string{"X-Stego-PSNR", "X-Stego-Message", "Content-Disposition"}
 	config.AllowCredentials = true
 	router.Use(cors.New(config))
 
