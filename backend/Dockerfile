@@ -2,15 +2,15 @@
 FROM golang:1.23-alpine AS builder
 WORKDIR /app
 
-RUN apk add --no-cache git
+RUN apk add --no-cache git gcc musl-dev lame
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o steganography-backend main.go
+RUN CGO_ENABLED=1 GOOS=linux go build -a -o steganography-backend main.go
 
 # Runtime
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates lame
 WORKDIR /root/
 
 COPY --from=builder /app/steganography-backend .
