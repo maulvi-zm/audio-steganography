@@ -1,0 +1,1 @@
+A full-stack web application for hiding and extracting secret messages in MP3 audio files using the Multiple-LSB steganography method with Extended Vigenère Cipher encryption.
