@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+
 	"steganography-backend/crypto"
 	"steganography-backend/models"
 	"steganography-backend/mp3parser"
@@ -286,10 +287,6 @@ func (lsb *MP3AncillaryLSBSteganography) generatePositions(dataLen, bytesNeeded 
 			}
 		}
 
-		// Return only the first bytesNeeded positions from the fixed permutation
-		if bytesNeeded > len(allPositions) {
-			bytesNeeded = len(allPositions)
-		}
 		positions = allPositions[:bytesNeeded]
 	} else {
 		for i := 0; i < bytesNeeded && i < dataLen; i++ {
